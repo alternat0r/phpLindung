@@ -5,7 +5,7 @@ It is a simple script to provide a simple login page for PHP. It is also configu
 The code are PoC only. It is based on Zubrag.com code with extensive modification:
 http://www.zubrag.com/scripts/password-protect.php
 
-NOTE: Lindung in Malay mean Protect.
+NOTE: Lindung in Malay means Protect.
 
 ## Usage
 Just simply put the following code on top of your code:
