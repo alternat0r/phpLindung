@@ -18,6 +18,8 @@ And your page will be lock until user input a correct username/password.
 
 ![2018-05-04_23-34-12](https://user-images.githubusercontent.com/1006000/39636797-d475c928-4ff3-11e8-9d5e-851e128744be.gif)
 
+Please refer to the source code comments for more information about the usage.
+
 ## Features
 1. Add random spaces
 2. Add random capitalization
