@@ -32,7 +32,7 @@ And your page will be lock until user input a correct username/password.
 5. Tested on PHP 5-5.6 only
 
 ## License
-1. CCC
+1. GNU General Public License v3.0
 2. Meh, feel free to modify and use.
 
 ## References
