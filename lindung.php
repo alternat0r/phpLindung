@@ -20,6 +20,8 @@ define('LOGOUT_URL', 'http://www.google.com.my/');
 define('TIMEOUT_MINUTES', 60);
 define('TIMEOUT_CHECK_ACTIVITY', true);
 define('ERR_MESSAGE', 'Incorrect!');
+define('SALTY', 'knock2_thanos_is_back_yo');
+define('COOKIE_SALTY', genCookie());
 
 /*
 ==============================================
@@ -44,7 +46,7 @@ define('F_SUBMIT', genStr("pizza_delivery"));
 $timeout = (TIMEOUT_MINUTES == 0 ? 0 : time() + TIMEOUT_MINUTES * 60);
 
 if(isset($_GET['logout'])) {
-  setcookie("verify", '', $timeout, '/'); // clear password;
+  setcookie(COOKIE_SALTY, '', $timeout, '/'); // clear password;
   header('Location: ' . LOGOUT_URL);
   exit();
 }
@@ -84,24 +86,24 @@ if (isset($_POST[F_PASSWORD])) {
   if (!USE_USERNAME && !in_array($pass, $LOGIN_INFORMATION) || (USE_USERNAME && ( !array_key_exists($login, $LOGIN_INFORMATION) || $LOGIN_INFORMATION[$login] != $pass ))) {
     showLoginPasswordProtect(ERR_MESSAGE);
   } else {
-    setcookie("verify", md5($login.'%'.$pass), $timeout, '/');
+    setcookie(COOKIE_SALTY, md5($login.'%'.$pass), $timeout, '/');
     unset($_POST[F_LOGIN]);
     unset($_POST[F_PASSWORD]);
     unset($_POST[F_SUBMIT]);
   }
 
 } else {
-  if (!isset($_COOKIE['verify'])) {
+  if (!isset($_COOKIE[COOKIE_SALTY])) {
     showLoginPasswordProtect("");
   }
 
   $found = false;
   foreach($LOGIN_INFORMATION as $key=>$val) {
     $lp = (USE_USERNAME ? $key : '') .'%'.$val;
-    if ($_COOKIE['verify'] == md5($lp)) {
+    if ($_COOKIE[COOKIE_SALTY] == md5($lp)) {
       $found = true;
       if (TIMEOUT_CHECK_ACTIVITY) {
-        setcookie("verify", md5($lp), $timeout, '/');
+        setcookie(COOKIE_SALTY, md5($lp), $timeout, '/');
       }
       break;
     }
@@ -230,6 +232,17 @@ function genNewline($input) {
     }
   }
   return $spc;
+}
+
+/*
+==============================================
+  Generate a cookie monster
+  A random cookie that survive in an hour only.
+  Modify according to your needs.
+============================================== */
+function genCookie() {
+  $salty = hash("sha256", SALTY . date('H:i'));
+  return $salty;
 }
 
 /*
