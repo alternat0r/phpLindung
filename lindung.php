@@ -20,8 +20,6 @@ define('LOGOUT_URL', 'http://www.google.com.my/');
 define('TIMEOUT_MINUTES', 60);
 define('TIMEOUT_CHECK_ACTIVITY', true);
 define('ERR_MESSAGE', 'Incorrect!');
-define('SALTY', 'knock2_thanos_is_back_yo');
-define('COOKIE_SALTY', genCookie());
 
 /*
 ==============================================
@@ -42,6 +40,8 @@ define('POLY_GARBAGE', true);    // true=add multi line of random html tag, comm
 define('F_PASSWORD', genStr("a_key_that_can_open_many_locks_is_called_masterkey"));
 define('F_LOGIN', genStr("your_pant_was_here"));
 define('F_SUBMIT', genStr("pizza_delivery"));
+define('SALTY', 'knock2_thanos_is_back_yo');
+define('COOKIE_SALTY', genCookie());
 
 $timeout = (TIMEOUT_MINUTES == 0 ? 0 : time() + TIMEOUT_MINUTES * 60);
 
@@ -237,7 +237,7 @@ function genNewline($input) {
 /*
 ==============================================
   Generate a cookie monster
-  A random cookie that survive in an hour only.
+  A random cookie that survive in 1 hour only.
   Modify according to your needs.
 ============================================== */
 function genCookie() {
