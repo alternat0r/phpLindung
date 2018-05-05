@@ -123,7 +123,7 @@ if (isset($_POST[F_PASSWORD])) {
 ============================================== */
 function genStr($salt) {
   if(isset($salt)) {
-    $seed = hash("sha256", date("h:i") . $salt);
+    $seed = hash("sha256", date("H") . $salt);
     $str = substr($seed, 0, 5);
   } else {
     $str = substr("bb457d93e8d9a131bf3917b2388ede11", 0, 5);
@@ -241,7 +241,7 @@ function genNewline($input) {
   Modify according to your needs.
 ============================================== */
 function genCookie() {
-  $salty = hash("sha256", SALTY . date('H:i'));
+  $salty = hash("sha1", SALTY . date('H'));
   return $salty;
 }
 
