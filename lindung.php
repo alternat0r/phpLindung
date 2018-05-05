@@ -118,7 +118,7 @@ if (isset($_POST[F_PASSWORD])) {
 ==============================================
   Used to generate sha256 based on current
   hour. Then, take out first 5 letter to be
-  use as variable name. Otherwise, use default
+  use as variable name. Otherwise, use random
   MD5 hash and take out 5 letter from it.
 ============================================== */
 function genStr($salt) {
@@ -126,7 +126,7 @@ function genStr($salt) {
     $seed = hash("sha256", date("H") . $salt);
     $str = substr($seed, 0, 5);
   } else {
-    $str = substr("bb457d93e8d9a131bf3917b2388ede11", 0, 5);
+    $str = substr(hash("md5", rand(99, 999)), 0, 5);
   }
   return $str;
 }
