@@ -4,11 +4,14 @@
 ==============================================
  Multiple login supported
  Usage:
-    'your_username' => 'your_password'
+    'your_username' => password_hash('your_password', PASSWORD_DEFAULT)
+
+ Generate a hash for a new password with:
+    php -r "echo password_hash('your_password', PASSWORD_DEFAULT), PHP_EOL;"
 ============================================== */
 $LOGIN_INFORMATION = array(
-  'admin' => 'admin654',
-  'henshin' => 'hakutominami'
+  'admin'    => '$2y$10$FKqSOfd6ogvD.WYV48uNMeo5TU7A3iXtdXD3.dlIVvG8iT5qDjrVG', // admin654 - CHANGE ME
+  'henshin'  => '$2y$10$XaTtZ98Azqn69qHmAd/N6urDELshxxPtW32dJ.WtdigfFPPDNZxV.'  // hakutominami - CHANGE ME
 );
 
 /*
@@ -20,6 +23,26 @@ define('LOGOUT_URL', 'http://www.google.com.my/');
 define('TIMEOUT_MINUTES', 60);
 define('TIMEOUT_CHECK_ACTIVITY', true);
 define('ERR_MESSAGE', 'Incorrect!');
+// Set to true only if you're behind a reverse proxy/load balancer you trust to set
+// X-Forwarded-Proto/X-Forwarded-For honestly (otherwise these headers are
+// client-controllable and unsafe to trust). Needed for the Secure cookie flag and
+// rate-limiting-by-IP to work correctly when requests are relayed through a proxy.
+define('TRUST_PROXY_HEADERS', false);
+
+/*
+==============================================
+  Rate limiting on failed login attempts, keyed
+  by client IP. State is file-based (no database
+  required) so it stays a single-file drop-in.
+============================================== */
+define('RATE_LIMIT_ON', true);
+define('RATE_LIMIT_MAX_ATTEMPTS', 5);        // failed attempts allowed per window
+define('RATE_LIMIT_WINDOW_SECONDS', 300);    // window the attempts above are counted over
+define('RATE_LIMIT_LOCKOUT_SECONDS', 300);   // lockout duration once the limit is hit
+// Where attempt counters are stored. Defaults to the system temp dir so nothing needs
+// to be writable inside the web root. On shared hosting where the temp dir isn't
+// private to your account, point this at a directory only your app can read/write.
+define('RATE_LIMIT_DIR', sys_get_temp_dir() . '/lindung_ratelimit_' . substr(hash('sha256', __FILE__), 0, 12));
 
 /*
 ==============================================
@@ -40,22 +63,238 @@ define('POLY_GARBAGE', true);    // true=add multi line of random html tag, comm
 define('F_PASSWORD', genStr("a_key_that_can_open_many_locks_is_called_masterkey"));
 define('F_LOGIN', genStr("your_pant_was_here"));
 define('F_SUBMIT', genStr("pizza_delivery"));
-define('SALTY', 'knock2_thanos_is_back_yo');
-define('COOKIE_SALTY', genCookie());
 
-$timeout = (TIMEOUT_MINUTES == 0 ? 0 : time() + TIMEOUT_MINUTES * 60);
+/*
+==============================================
+  SECRET_KEY signs the session cookie (HMAC).
+  Anyone who knows this value can forge a valid
+  login session, so it MUST be changed to a
+  random, private value before deployment - it
+  is not safe to leave the default below.
+  Generate one with:
+    php -r "echo bin2hex(random_bytes(32)), PHP_EOL;"
+============================================== */
+define('SECRET_KEY', 'CHANGE_ME_TO_A_RANDOM_SECRET_BEFORE_DEPLOYING');
 
-if(isset($_GET['logout'])) {
-  setcookie(COOKIE_SALTY, '', $timeout, '/'); // clear password;
+if (strpos(SECRET_KEY, 'CHANGE_ME') === 0 || strlen(SECRET_KEY) < 20) {
+  die('lindung.php: SECRET_KEY looks like it is still the default placeholder (or too short to be a real secret). Generate a random value (e.g. `php -r "echo bin2hex(random_bytes(32));"`) and set it before using this script.');
+}
+
+define('COOKIE_NAME', hash('sha1', SECRET_KEY . '_cookie'));
+
+$timeoutMinutesInt = (int) TIMEOUT_MINUTES;
+$sessionExpireAt = ($timeoutMinutesInt === 0) ? 0 : time() + $timeoutMinutesInt * 60;
+// Browser-side cookie lifetime; 0 = session cookie (expires when browser closes)
+$cookieLifetime = $sessionExpireAt;
+
+if (!function_exists('setSessionCookie')) {
+  function setSessionCookie($value, $expire) {
+    $secure = !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off';
+    if (!$secure && TRUST_PROXY_HEADERS && !empty($_SERVER['HTTP_X_FORWARDED_PROTO'])) {
+      $secure = strtolower($_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https';
+    }
+    if (PHP_VERSION_ID >= 70300) {
+      setcookie(COOKIE_NAME, $value, array(
+        'expires' => $expire,
+        'path' => '/',
+        'secure' => $secure,
+        'httponly' => true,
+        'samesite' => 'Lax',
+      ));
+    } else {
+      // Pre-7.3 fallback: SameSite via the path-string trick.
+      setcookie(COOKIE_NAME, $value, $expire, '/; SameSite=Lax', '', $secure, true);
+    }
+  }
+}
+
+if (!function_exists('base64UrlEncode')) {
+  function base64UrlEncode($data) {
+    return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+  }
+}
+
+if (!function_exists('base64UrlDecode')) {
+  function base64UrlDecode($data) {
+    return base64_decode(strtr($data, '-_', '+/'));
+  }
+}
+
+if (!function_exists('hash_equals')) {
+  // Polyfill for PHP < 5.6, where hash_equals() doesn't exist yet.
+  function hash_equals($known, $user) {
+    if (!is_string($known) || !is_string($user) || strlen($known) !== strlen($user)) {
+      return false;
+    }
+    $diff = 0;
+    for ($i = 0; $i < strlen($known); $i++) {
+      $diff |= ord($known[$i]) ^ ord($user[$i]);
+    }
+    return $diff === 0;
+  }
+}
+
+/*
+==============================================
+  Session token format: identity.expireAt.hmac
+  The HMAC covers identity+expireAt so a token
+  cannot be replayed with a different identity
+  or a forged/extended expiry, and expiry is
+  enforced server-side (not left to the browser).
+============================================== */
+if (!function_exists('generateSessionToken')) {
+  function generateSessionToken($identity, $expireAt) {
+    $payload = base64UrlEncode($identity) . '.' . $expireAt;
+    $sig = hash_hmac('sha256', $payload, SECRET_KEY);
+    return $payload . '.' . $sig;
+  }
+}
+
+if (!function_exists('verifySessionToken')) {
+  function verifySessionToken($token) {
+    $parts = explode('.', $token);
+    if (count($parts) !== 3) {
+      return false;
+    }
+    list($encIdentity, $expireAt, $sig) = $parts;
+    $payload = $encIdentity . '.' . $expireAt;
+    $expectedSig = hash_hmac('sha256', $payload, SECRET_KEY);
+    if (!hash_equals($expectedSig, $sig)) {
+      return false;
+    }
+    $expireAt = (int) $expireAt;
+    if ($expireAt !== 0 && time() > $expireAt) {
+      return false;
+    }
+    $identity = base64UrlDecode($encIdentity);
+    if ($identity === false || $identity === '') {
+      return false;
+    }
+    return $identity;
+  }
+}
+
+if (!function_exists('getClientIp')) {
+  function getClientIp() {
+    if (TRUST_PROXY_HEADERS && !empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+      $forwardedFor = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
+      return trim($forwardedFor[0]);
+    }
+    return isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : 'unknown';
+  }
+}
+
+if (!function_exists('rateLimitFile')) {
+  function rateLimitFile($ip) {
+    return RATE_LIMIT_DIR . '/' . hash('sha256', SECRET_KEY . '|' . $ip) . '.json';
+  }
+}
+
+if (!function_exists('rateLimitOpen')) {
+  // Opens (creating if needed) the per-IP state file and returns the handle, or
+  // false if storage isn't available - callers should fail open in that case
+  // rather than let a storage problem lock everyone out of the site.
+  function rateLimitOpen($ip) {
+    if (!is_dir(RATE_LIMIT_DIR)) {
+      @mkdir(RATE_LIMIT_DIR, 0700, true);
+    }
+    return @fopen(rateLimitFile($ip), 'c+');
+  }
+}
+
+if (!function_exists('rateLimitRead')) {
+  function rateLimitRead($fp) {
+    rewind($fp);
+    $raw = stream_get_contents($fp);
+    $data = $raw ? json_decode($raw, true) : null;
+    if (!is_array($data)) {
+      $data = array('attempts' => 0, 'window_started_at' => time(), 'locked_until' => 0);
+    }
+    return $data;
+  }
+}
+
+if (!function_exists('rateLimitSecondsRemaining')) {
+  // Returns seconds until the lockout for this IP clears, or 0 if it isn't locked out.
+  function rateLimitSecondsRemaining($ip) {
+    if (!RATE_LIMIT_ON) {
+      return 0;
+    }
+    $fp = rateLimitOpen($ip);
+    if (!$fp) {
+      return 0;
+    }
+    flock($fp, LOCK_SH);
+    $data = rateLimitRead($fp);
+    flock($fp, LOCK_UN);
+    fclose($fp);
+
+    $remaining = $data['locked_until'] - time();
+    return $remaining > 0 ? $remaining : 0;
+  }
+}
+
+if (!function_exists('rateLimitRecordFailure')) {
+  function rateLimitRecordFailure($ip) {
+    if (!RATE_LIMIT_ON) {
+      return;
+    }
+    $fp = rateLimitOpen($ip);
+    if (!$fp) {
+      return;
+    }
+    flock($fp, LOCK_EX);
+    $data = rateLimitRead($fp);
+    $now = time();
+
+    if ($now - $data['window_started_at'] > RATE_LIMIT_WINDOW_SECONDS) {
+      $data['attempts'] = 0;
+      $data['window_started_at'] = $now;
+    }
+
+    $data['attempts']++;
+    if ($data['attempts'] >= RATE_LIMIT_MAX_ATTEMPTS) {
+      $data['locked_until'] = $now + RATE_LIMIT_LOCKOUT_SECONDS;
+      $data['attempts'] = 0;
+      $data['window_started_at'] = $now;
+    }
+
+    rewind($fp);
+    ftruncate($fp, 0);
+    fwrite($fp, json_encode($data));
+    fflush($fp);
+    flock($fp, LOCK_UN);
+    fclose($fp);
+  }
+}
+
+if (!function_exists('rateLimitReset')) {
+  function rateLimitReset($ip) {
+    if (!RATE_LIMIT_ON) {
+      return;
+    }
+    @unlink(rateLimitFile($ip));
+  }
+}
+
+if (isset($_GET['logout'])) {
+  setSessionCookie('', time() - 3600);
   header('Location: ' . LOGOUT_URL);
   exit();
 }
 
-if(!function_exists('showLoginPasswordProtect')) {
+if (!function_exists('showLoginPasswordProtect')) {
   function showLoginPasswordProtect($error_msg) {
-    if( !empty($error_msg)) { $strErrorMessage = "<center><span style='color:red; font-weight:bold'>".$error_msg."</span></center><br>"; } else { $strErrorMessage = ""; }
-    if (USE_USERNAME) { $strUsername = "<input required style='height:30px; width:300px' type='input' name='".F_LOGIN."'/>"; } else { $strUsername = ""; };
-    
+    // Prevent the login form from being framed (clickjacking) or MIME-sniffed.
+    header('X-Frame-Options: DENY');
+    header('X-Content-Type-Options: nosniff');
+
+    $inputStyle = "width:100%; height:44px; margin:0 0 12px; padding:0 14px; border:1px solid #d9dbe3; border-radius:10px; font-size:15px; color:#20222b; background:#fbfbfd; box-sizing:border-box; outline:none;";
+    $buttonStyle = "width:100%; height:44px; border:none; border-radius:10px; background:#4c4fe0; color:#ffffff; font-size:15px; font-weight:600; letter-spacing:0.02em; cursor:pointer;";
+
+    if( !empty($error_msg)) { $strErrorMessage = "<div style='background:#fdecec; color:#c0392b; font-size:13px; font-weight:600; padding:10px 14px; border-radius:10px; margin:0 0 16px; text-align:center;'>".$error_msg."</div>"; } else { $strErrorMessage = ""; }
+    if (USE_USERNAME) { $strUsername = "<input required style='".$inputStyle."' type='text' name='".F_LOGIN."' placeholder='Username'/>"; } else { $strUsername = ""; };
+
 /*
 ==============================================
   You can modify the following login page layout
@@ -63,15 +302,18 @@ if(!function_exists('showLoginPasswordProtect')) {
 ============================================== */
     $strBody = "<html>
 <head>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>☺</title>
 <link rel='icon' type='image/png' href='data:image/png;base64,iVBORw0KGgo=''>
 </head>
-<body>
-<form method='post'><br>
-".$strErrorMessage."<center>
-".$strUsername."<input required style='height:30px; width:300px' type='password' name='[[F_PASSWORD]]'><button style='height:30px;' type='submit' name='[[F_SUBMIT]]'>▶</button>
-</center>
+<body style='margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:#f0f1f6; font-family:system-ui, -apple-system, sans-serif;'>
+<div style='width:100%; max-width:320px; margin:0 20px; padding:36px 30px; background:#ffffff; border-radius:16px; box-shadow:0 12px 32px rgba(30,32,60,0.10); box-sizing:border-box; text-align:center;'>
+<div style='font-size:30px; line-height:1; margin:0 0 20px;'>☺</div>
+".$strErrorMessage."<form method='post'>
+".$strUsername."<input required style='".$inputStyle."' type='password' name='[[F_PASSWORD]]' placeholder='Password'>
+<button style='".$buttonStyle."' type='submit' name='[[F_SUBMIT]]'>▶</button>
 </form>
+</div>
 </body>
 </html>";
     echo polyEverything($strBody);
@@ -80,33 +322,49 @@ if(!function_exists('showLoginPasswordProtect')) {
 }
 
 if (isset($_POST[F_PASSWORD])) {
+  $clientIp = getClientIp();
+  $lockoutRemaining = rateLimitSecondsRemaining($clientIp);
+
+  if ($lockoutRemaining > 0) {
+    $waitMinutes = (int) ceil($lockoutRemaining / 60);
+    showLoginPasswordProtect('Too many attempts. Try again in ' . $waitMinutes . ' minute' . ($waitMinutes === 1 ? '' : 's') . '.');
+  }
+
   $login = isset($_POST[F_LOGIN]) ? $_POST[F_LOGIN] : '';
   $pass = $_POST[F_PASSWORD];
 
-  if (!USE_USERNAME && !in_array($pass, $LOGIN_INFORMATION) || (USE_USERNAME && ( !array_key_exists($login, $LOGIN_INFORMATION) || $LOGIN_INFORMATION[$login] != $pass ))) {
+  $identity = null;
+  foreach ($LOGIN_INFORMATION as $key => $hash) {
+    if (USE_USERNAME && $key !== $login) {
+      continue;
+    }
+    if (password_verify($pass, $hash)) {
+      $identity = $key;
+      break;
+    }
+  }
+
+  if ($identity === null) {
+    rateLimitRecordFailure($clientIp);
     showLoginPasswordProtect(ERR_MESSAGE);
   } else {
-    setcookie(COOKIE_SALTY, md5($login.'%'.$pass), $timeout, '/');
+    rateLimitReset($clientIp);
+    setSessionCookie(generateSessionToken($identity, $sessionExpireAt), $cookieLifetime);
     unset($_POST[F_LOGIN]);
     unset($_POST[F_PASSWORD]);
     unset($_POST[F_SUBMIT]);
   }
 
 } else {
-  if (!isset($_COOKIE[COOKIE_SALTY])) {
+  if (!isset($_COOKIE[COOKIE_NAME])) {
     showLoginPasswordProtect("");
   }
 
-  $found = false;
-  foreach($LOGIN_INFORMATION as $key=>$val) {
-    $lp = (USE_USERNAME ? $key : '') .'%'.$val;
-    if ($_COOKIE[COOKIE_SALTY] == md5($lp)) {
-      $found = true;
-      if (TIMEOUT_CHECK_ACTIVITY) {
-        setcookie(COOKIE_SALTY, md5($lp), $timeout, '/');
-      }
-      break;
-    }
+  $identity = verifySessionToken($_COOKIE[COOKIE_NAME]);
+  $found = ($identity !== false && array_key_exists($identity, $LOGIN_INFORMATION));
+
+  if ($found && TIMEOUT_CHECK_ACTIVITY) {
+    setSessionCookie(generateSessionToken($identity, $sessionExpireAt), $cookieLifetime);
   }
 
   if (!$found) {
@@ -136,10 +394,10 @@ function genStr($salt) {
   To generate random spacing
 ============================================== */
 function genSpace($input) {
+  $spc = "";
   if (POLY_ON == true) {
     if (POLY_SPACE == true) {
       $arr1 = str_split($input);
-      $spc = " ";
       foreach($arr1 as $val) {
         if (strstr($val, " ")) {
           for($i=0; $i<rand(2, 9); $i++) {
@@ -150,6 +408,9 @@ function genSpace($input) {
           }
         }
       }
+  }
+  if (empty($spc)) {
+    $spc = $input;
   }
   return $spc;
 }
@@ -209,6 +470,9 @@ function genCap($input) {
     }
   }
   }
+  if (empty($spc)) {
+    $spc = $input;
+  }
   return $spc;
 }
 
@@ -236,36 +500,22 @@ function genNewline($input) {
 
 /*
 ==============================================
-  Generate a cookie monster
-  A random cookie that survive in 1 hour only.
-  Modify according to your needs.
-============================================== */
-function genCookie() {
-  $salty = hash("sha1", SALTY . date('H'));
-  return $salty;
-}
-
-/*
-==============================================
   This is where the polymorphic part take
   place depending on your settings.
 ============================================== */
 function polyEverything($input) {
+  $finalWord = $input;
+
   if (POLY_ON == true) {
     if (POLY_CAPITAL == true) {
-      $word = genCap($input);
-      $finalWord = $word;
+      $finalWord = genCap($finalWord);
     }
 
     if (POLY_SPACE == true) {
-      $word = genSpace($input);
-      $finalWord = $word;
+      $finalWord = genSpace($finalWord);
     }
 
     if (POLY_GARBAGE == true) {
-      if(empty($finalWord)) {
-        $finalWord = $input;
-      }
       $word3 = genGarbage($finalWord);
       if (POLY_CAPITAL == true) {
         $finalWord = genCap($word3);
@@ -275,29 +525,17 @@ function polyEverything($input) {
     }
 
     if (POLY_NEWLINE == true) {
-      if(empty($finalWord)) {
-        $finalWord = $input;
-      }
-      $word2 = genNewline($finalWord);
-      $finalWord = $word2;
+      $finalWord = genNewline($finalWord);
     }
-
-    // Replace once again with custom variable
-    if (POLY_CAPITAL == true) {
-      $strFUpdate = str_ireplace("[[F_PASSWORD]]", F_PASSWORD, $finalWord);
-      $strFUpdate = str_ireplace("[[F_SUBMIT]]", F_SUBMIT, $strFUpdate);
-      $finalWord = $strFUpdate;
-    }
-
-    if(empty($finalWord)) {
-      return $input;
-    } else {
-      return $finalWord;
-    }
-  
-  } else {
-    return $input;
   }
+
+  // Placeholders must always be substituted, regardless of POLY_ON/POLY_CAPITAL,
+  // otherwise the login form ships with a literal "[[F_PASSWORD]]" field name
+  // and the login POST handler can never match it.
+  $finalWord = str_ireplace("[[F_PASSWORD]]", F_PASSWORD, $finalWord);
+  $finalWord = str_ireplace("[[F_SUBMIT]]", F_SUBMIT, $finalWord);
+
+  return empty($finalWord) ? $input : $finalWord;
 }
 
 ?>
