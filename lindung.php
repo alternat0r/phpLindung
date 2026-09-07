@@ -16,6 +16,23 @@ $LOGIN_INFORMATION = array(
 
 /*
 ==============================================
+ The example accounts above ship in this public
+ source, so their passwords are public too.
+ Refuse to run while any of them is still in
+ place - same policy as SECRET_KEY below.
+============================================== */
+$SHIPPED_DEFAULT_HASHES = array(
+  '$2y$10$FKqSOfd6ogvD.WYV48uNMeo5TU7A3iXtdXD3.dlIVvG8iT5qDjrVG',
+  '$2y$10$XaTtZ98Azqn69qHmAd/N6urDELshxxPtW32dJ.WtdigfFPPDNZxV.'
+);
+foreach ($LOGIN_INFORMATION as $shippedUser => $shippedHash) {
+  if (in_array($shippedHash, $SHIPPED_DEFAULT_HASHES, true)) {
+    die('lindung.php: the example account "' . htmlspecialchars($shippedUser, ENT_QUOTES) . '" still uses the password that ships in this public source, so anyone can log in. Replace its hash before using this script. Generate one with: php -r "echo password_hash(\'your_password\', PASSWORD_DEFAULT), PHP_EOL;"');
+  }
+}
+
+/*
+==============================================
  General settings
 ============================================== */
 define('USE_USERNAME', false);
@@ -76,11 +93,15 @@ define('F_SUBMIT', genStr("pizza_delivery"));
 ============================================== */
 define('SECRET_KEY', 'CHANGE_ME_TO_A_RANDOM_SECRET_BEFORE_DEPLOYING');
 
-if (strpos(SECRET_KEY, 'CHANGE_ME') === 0 || strlen(SECRET_KEY) < 20) {
+if (strpos(SECRET_KEY, 'CHANGE_ME') === 0 || strlen(SECRET_KEY) < 32) {
   die('lindung.php: SECRET_KEY looks like it is still the default placeholder (or too short to be a real secret). Generate a random value (e.g. `php -r "echo bin2hex(random_bytes(32));"`) and set it before using this script.');
 }
 
-define('COOKIE_NAME', hash('sha1', SECRET_KEY . '_cookie'));
+// The cookie name is handed to every client, so it must NOT be derived from
+// SECRET_KEY: publishing hash(SECRET_KEY) gives away an offline brute-force
+// oracle for the signing key. Derive it from the file path instead - it only
+// has to be stable and per-deployment, not secret.
+define('COOKIE_NAME', 'lp_' . substr(hash('sha256', __FILE__ . '|cookie'), 0, 32));
 
 $timeoutMinutesInt = (int) TIMEOUT_MINUTES;
 $sessionExpireAt = ($timeoutMinutesInt === 0) ? 0 : time() + $timeoutMinutesInt * 60;
@@ -152,6 +173,10 @@ if (!function_exists('generateSessionToken')) {
 
 if (!function_exists('verifySessionToken')) {
   function verifySessionToken($token) {
+    // A cookie sent as "name[]=x" arrives as an array and would fatal explode().
+    if (!is_string($token)) {
+      return false;
+    }
     $parts = explode('.', $token);
     if (count($parts) !== 3) {
       return false;
@@ -277,6 +302,26 @@ if (!function_exists('rateLimitReset')) {
   }
 }
 
+if (!function_exists('sendSecurityHeaders')) {
+  // Sent on every response this script produces - the login form AND the
+  // protected page behind it. Framing is denied outright; if you legitimately
+  // embed the protected page in a frame on your own site, change DENY to
+  // SAMEORIGIN. no-store keeps authenticated pages out of shared proxy caches
+  // and the back/forward cache.
+  function sendSecurityHeaders() {
+    if (headers_sent()) {
+      return;
+    }
+    header('X-Frame-Options: DENY');
+    header('X-Content-Type-Options: nosniff');
+    header('Referrer-Policy: no-referrer');
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    header('Pragma: no-cache');
+  }
+}
+
+sendSecurityHeaders();
+
 if (isset($_GET['logout'])) {
   setSessionCookie('', time() - 3600);
   header('Location: ' . LOGOUT_URL);
@@ -285,10 +330,6 @@ if (isset($_GET['logout'])) {
 
 if (!function_exists('showLoginPasswordProtect')) {
   function showLoginPasswordProtect($error_msg) {
-    // Prevent the login form from being framed (clickjacking) or MIME-sniffed.
-    header('X-Frame-Options: DENY');
-    header('X-Content-Type-Options: nosniff');
-
     $inputStyle = "width:100%; height:44px; margin:0 0 12px; padding:0 14px; border:1px solid #d9dbe3; border-radius:10px; font-size:15px; color:#20222b; background:#fbfbfd; box-sizing:border-box; outline:none;";
     $buttonStyle = "width:100%; height:44px; border:none; border-radius:10px; background:#4c4fe0; color:#ffffff; font-size:15px; font-weight:600; letter-spacing:0.02em; cursor:pointer;";
 
@@ -330,8 +371,11 @@ if (isset($_POST[F_PASSWORD])) {
     showLoginPasswordProtect('Too many attempts. Try again in ' . $waitMinutes . ' minute' . ($waitMinutes === 1 ? '' : 's') . '.');
   }
 
-  $login = isset($_POST[F_LOGIN]) ? $_POST[F_LOGIN] : '';
-  $pass = $_POST[F_PASSWORD];
+  // Either field can arrive as an array (e.g. "field[]=x"), which would throw
+  // an uncaught TypeError inside password_verify(). Coerce anything that isn't
+  // a string to '' so it just fails the check and counts as a failed attempt.
+  $login = (isset($_POST[F_LOGIN]) && is_string($_POST[F_LOGIN])) ? $_POST[F_LOGIN] : '';
+  $pass = is_string($_POST[F_PASSWORD]) ? $_POST[F_PASSWORD] : '';
 
   $identity = null;
   foreach ($LOGIN_INFORMATION as $key => $hash) {
